@@ -1,0 +1,5 @@
+axios.get("http://localhost:3000/protected", {
+  headers: {
+    Authorization: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyIjp7ImlkIjoiNjgzMmY5Njc5MDg4YmVkZDE2NjBjZTUyIiwidXNlcm5hbWUiOiJ2In0sImlhdCI6MTc0ODE3MTIxNCwiZXhwIjoxNzQ4MTc0ODE0fQ.JfLTcEsHltKY3-WEunPzbXsP5uatplzZ3CT3xH1pYRw"
+  }
+})
