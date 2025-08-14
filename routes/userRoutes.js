@@ -220,6 +220,37 @@ router.get("/userlikedposts/:id", async (req, res) => {
     }
 });
 
+router.get("/userfollowing/:id", async (req, res) => {
+    try {
+        const { type } = req.query; // 'followers' or 'following'
+
+        // Step 1: Fetch the user and populate only selected fields
+        const user = await User.findOne({ userid: req.params.id })
+            .select("-passwordHash")
+            .populate("followers", "userid username profilePicture") // only these fields
+            .populate("following", "userid username profilePicture");
+
+        if (!user) return res.status(404).json({ message: "User not found" });
+
+        let result = user.toObject();
+
+        // Step 2: Return only what was requested
+        if (type === "followers") {
+            return res.json({ followers: result.followers });
+        } else if (type === "following") {
+            return res.json({ following: result.following });
+        }
+
+        // Step 3: Default - return full profile with trimmed followers/following
+        res.json(result);
+
+    } catch (err) {
+        console.error("Error fetching user data:", err);
+        res.status(500).json({ message: "Server error" });
+    }
+});
+
+
 router.get("/bymobile/:mobile", async (req, res) => {
     try {
 
