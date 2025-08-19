@@ -385,6 +385,60 @@ router.put("/:id/unfollow", async (req, res) => {
         res.status(500).json({ message: "Server error" });
     }
 });
+// remove follower
+router.put("/:id/remove-follower", async (req, res) => {
+    const { userId } = req.body; // userId = the user to remove from followers
+    const targetUserId = req.params.id; // id = the profile owner (you)
+
+    if (userId === targetUserId) {
+        return res.status(400).json({ message: "You can't remove yourself" });
+    }
+
+    try {
+        const targetUser = await User.findById(targetUserId); // profile owner
+        const followerUser = await User.findById(userId);     // the one who follows
+
+        if (!targetUser || !followerUser) {
+            return res.status(404).json({ message: "User not found" });
+        }
+
+        if (targetUser.followers.includes(userId)) {
+            // Remove follower from your followers list
+            targetUser.followers.pull(userId);
+            // Remove yourself from their following list
+            followerUser.following.pull(targetUserId);
+
+            await targetUser.save();
+            await followerUser.save();
+
+            // Safely log user action
+            try {
+                await logUserAction({
+                    user: targetUserId,  // you (the profile owner) initiated this
+                    action: "remove_follower",
+                    targetType: "User",
+                    targetId: userId, // the follower being removed
+                    device: req.headers["user-agent"],
+                    location: {
+                        ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress || "",
+                        country: req.headers["cf-ipcountry"] || "",
+                        city: "",
+                        pincode: ""
+                    }
+                });
+            } catch (logError) {
+                console.error("Log error (non-blocking):", logError.message);
+            }
+
+            return res.json({ message: "Follower removed successfully" });
+        } else {
+            return res.status(400).json({ message: "This user is not your follower" });
+        }
+    } catch (err) {
+        console.error("Remove follower error:", err);
+        return res.status(500).json({ message: "Server error" });
+    }
+});
 
 
 // update user
