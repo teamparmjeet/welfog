@@ -389,6 +389,7 @@ router.put("/:id/unfollow", async (req, res) => {
 router.put("/:id/remove-follower", async (req, res) => {
     const { userId } = req.body; // userId = the user to remove from followers
     const targetUserId = req.params.id; // id = the profile owner (you)
+    console.log(targetUserId)
 
     if (userId === targetUserId) {
         return res.status(400).json({ message: "You can't remove yourself" });
@@ -397,7 +398,7 @@ router.put("/:id/remove-follower", async (req, res) => {
     try {
         const targetUser = await User.findById(targetUserId); // profile owner
         const followerUser = await User.findById(userId);     // the one who follows
-
+       
         if (!targetUser || !followerUser) {
             return res.status(404).json({ message: "User not found" });
         }

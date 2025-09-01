@@ -29,7 +29,7 @@ const commentRoute = require("./routes/commentRoute");
 // ✅ Removed authentication requirement
 app.use("/api/users", userRoutes);
 app.use("/api/reels", reelRoute);
-app.use("/api/music", musicRoute);
+app.use("/api/", musicRoute);
 app.use("/api/comment", commentRoute);
 
 app.listen(PORT, () => {

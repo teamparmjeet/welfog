@@ -4,13 +4,19 @@ const router = express.Router();
 const Reel = require("../models/Reel");
 const User = require("../models/Users");
 const multer = require("multer");
+const fs = require("fs");
+const path = require("path");
+const ffmpeg = require("fluent-ffmpeg");
+const ffmpegInstaller = require("@ffmpeg-installer/ffmpeg");
+const tmp = require("tmp")
 const logUserAction = require("../utils/logUserAction");
 
 
 const { uploadToS3 } = require("../lib/s3");
 
-
+ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 const upload = multer({ storage: multer.memoryStorage() });
+
 router.post("/", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) {
@@ -20,19 +26,53 @@ router.post("/", upload.single("file"), async (req, res) => {
       });
     }
 
-    const folder = req.body.folder || "uploads"; // Default folder
-    const uploadedFileUrl = await uploadToS3(req.file, folder);
+    // Save uploaded buffer to a temp file
+    const inputTmp = tmp.fileSync({ postfix: path.extname(req.file.originalname) });
+    fs.writeFileSync(inputTmp.name, req.file.buffer);
+
+    // Create another temp file for compressed video
+    const outputTmp = tmp.fileSync({ postfix: ".mp4" });
+
+    // Run ffmpeg compression
+    await new Promise((resolve, reject) => {
+      ffmpeg(inputTmp.name)
+        .outputOptions([
+          "-c:v libx264",     // H.264 video codec
+          "-preset veryfast", // speed vs size
+          "-crf 28",          // quality (lower = better, 23 default)
+          "-b:v 800k",        // target bitrate
+          "-c:a aac",         // audio codec
+          "-b:a 128k"
+        ])
+        .save(outputTmp.name)
+        .on("end", resolve)
+        .on("error", reject);
+    });
+
+    // Read compressed file back into buffer
+    const compressedBuffer = fs.readFileSync(outputTmp.name);
+
+    // Upload to S3
+    const folder = req.body.folder || "uploads";
+    const uploadedFileUrl = await uploadToS3(
+      { buffer: compressedBuffer, originalname: "compressed-" + req.file.originalname },
+      folder
+    );
+
+    // Cleanup temp files
+    inputTmp.removeCallback();
+    outputTmp.removeCallback();
 
     res.status(200).json({
-      message: "Single file uploaded successfully!",
+      message: "Video compressed & uploaded successfully!",
       success: true,
       file: uploadedFileUrl
     });
 
   } catch (error) {
-    console.error("Error on file upload:", error);
+    console.error("Error on video upload:", error);
     res.status(500).json({
-      message: "Error on file upload!",
+      message: "Error on video upload!",
       success: false
     });
   }
