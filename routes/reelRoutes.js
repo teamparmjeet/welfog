@@ -14,83 +14,250 @@ const { uploadToS3 } = require("../lib/s3");
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
 
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 200 * 1024 * 1024 } // allow up to 200MB
+});
+
+
+router.post(
+    "/full-upload",
+    upload.fields([
+        { name: "video", maxCount: 1 },
+        { name: "thumbnail", maxCount: 1 },
+    ]),
+    async (req, res) => {
+        console.log("===== [FULL UPLOAD STARTED] =====");
+
+        let inputTmp, outputTmp, thumbTmp;
+
+        try {
+            console.log("[STEP 1] Incoming request body:", req.body);
+            console.log("[STEP 1] Incoming files:", Object.keys(req.files || {}));
+
+            const { user, userid, username, caption, music } = req.body;
+            if (!user || !req.files || !req.files.video) {
+                console.error("[ERROR] Missing required data: user or video file");
+                return res.status(400).json({ success: false, message: "User or video missing!" });
+            }
+
+            const videoFile = req.files.video[0];
+            const thumbFile = req.files.thumbnail ? req.files.thumbnail[0] : null;
+            console.log("[STEP 2] Video file received:", videoFile.originalname);
+            if (thumbFile) console.log("[STEP 2] Thumbnail file received:", thumbFile.originalname);
+            else console.log("[STEP 2] No thumbnail provided, will auto-generate");
+
+            // --- Step 3: Compress video ---
+            console.log("[STEP 3] Starting video compression...");
+            inputTmp = tmp.fileSync({ postfix: path.extname(videoFile.originalname) });
+            fs.writeFileSync(inputTmp.name, videoFile.buffer);
+            outputTmp = tmp.fileSync({ postfix: ".mp4" });
+
+            await new Promise((resolve, reject) => {
+                ffmpeg(inputTmp.name)
+                    .outputOptions([
+                        "-c:v libx264",
+                        "-preset veryfast",
+                        "-crf 28",
+                        "-b:v 800k",
+                        "-c:a aac",
+                        "-b:a 128k",
+                    ])
+                    .save(outputTmp.name)
+                    .on("end", () => {
+                        console.log("[STEP 3] Video compression completed");
+                        resolve();
+                    })
+                    .on("error", (err) => {
+                        console.error("[ERROR] Video compression failed:", err.message);
+                        reject(err);
+                    });
+            });
+
+            const compressedBuffer = fs.readFileSync(outputTmp.name);
+            console.log("[STEP 4] Uploading compressed video to S3...");
+            const videoUrl = await uploadToS3(
+                { buffer: compressedBuffer, originalname: "compressed-" + videoFile.originalname, mimetype: "video/mp4" },
+                "videos"
+            );
+            console.log("[STEP 4] Video uploaded successfully:", videoUrl);
+
+            // --- Step 5: Handle thumbnail ---
+            let thumbnailUrl = null;
+            try {
+                if (thumbFile) {
+                    console.log("[STEP 5] Uploading provided thumbnail...");
+                    thumbnailUrl = await uploadToS3(thumbFile, "thumbnails");
+                    console.log("[STEP 5] Thumbnail uploaded successfully:", thumbnailUrl);
+                } else {
+                    console.log("[STEP 5] Generating thumbnail from compressed video...");
+                    thumbTmp = tmp.fileSync({ postfix: ".jpg" });
+                    await new Promise((resolve, reject) => {
+                        ffmpeg(outputTmp.name) // <-- use compressed file path
+                            .on("end", () => {
+                                console.log("[STEP 5] Thumbnail generation complete");
+                                resolve();
+                            })
+                            .on("error", (err) => {
+                                console.error("[ERROR] Thumbnail generation failed:", err.message);
+                                reject(err);
+                            })
+                            .screenshots({
+                                timestamps: [1],
+                                filename: path.basename(thumbTmp.name),
+                                folder: path.dirname(thumbTmp.name),
+                                size: "640x?",
+                            });
+                    });
+                    const thumbBuffer = fs.readFileSync(thumbTmp.name);
+                    console.log("[STEP 5] Uploading generated thumbnail...");
+                    thumbnailUrl = await uploadToS3(
+                        { buffer: thumbBuffer, originalname: `thumb-${Date.now()}.jpg`, mimetype: "image/jpeg" },
+                        "thumbnails"
+                    );
+                    console.log("[STEP 5] Thumbnail uploaded successfully:", thumbnailUrl);
+                }
+            } catch (thumbError) {
+                console.error("[WARNING] Thumbnail step failed:", thumbError.message);
+                // fallback: use placeholder thumbnail
+                thumbnailUrl = "https://your-bucket/default-thumb.jpg";
+            }
+
+            // --- Step 6: Save to DB ---
+            console.log("[STEP 6] Saving reel to database...");
+            const newReel = new Reel({
+                user,
+                userid,
+                username,
+                videoUrl,
+                thumbnailUrl,
+                caption,
+                music: music || null,
+            });
+            const savedReel = await newReel.save();
+            console.log("[STEP 6] Reel saved with ID:", savedReel._id);
+
+            // --- Step 7: Log user action ---
+            try {
+                console.log("[STEP 7] Logging user action...");
+                await logUserAction({
+                    user: savedReel.user,
+                    action: "upload_reel",
+                    targetType: "Reel",
+                    targetId: savedReel._id,
+                    device: req.headers["user-agent"],
+                    location: {
+                        ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress || "",
+                        country: req.headers["cf-ipcountry"] || "",
+                        city: "",
+                        pincode: "",
+                    },
+                });
+                console.log("[STEP 7] User action logged successfully");
+            } catch (logError) {
+                console.error("[WARNING] Log user action failed:", logError.message);
+            }
+
+            console.log("===== [FULL UPLOAD COMPLETED SUCCESSFULLY] =====");
+            res.status(201).json({
+                message: "Reel uploaded successfully!",
+                success: true,
+                data: savedReel,
+            });
+        } catch (error) {
+            console.error("===== [FULL UPLOAD ERROR] =====");
+            console.error(error);
+            res.status(500).json({ success: false, message: "Error uploading reel" });
+        } finally {
+            // clean up temp files at the very end
+            try {
+                if (inputTmp) inputTmp.removeCallback();
+                if (outputTmp) outputTmp.removeCallback();
+                if (thumbTmp) thumbTmp.removeCallback();
+            } catch (cleanupErr) {
+                console.error("[WARNING] Temp cleanup failed:", cleanupErr.message);
+            }
+        }
+    }
+);
+
+
 
 router.post("/", upload.single("file"), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({
-        message: "No file uploaded",
-        success: false
-      });
+    try {
+        if (!req.file) {
+            return res.status(400).json({
+                message: "No file uploaded",
+                success: false
+            });
+        }
+
+        const folder = req.body.folder || "uploads";
+
+        // ✅ Check if uploaded file is video
+        if (req.file.mimetype.startsWith("video/")) {
+            // Save uploaded buffer to a temp file
+            const inputTmp = tmp.fileSync({ postfix: path.extname(req.file.originalname) });
+            fs.writeFileSync(inputTmp.name, req.file.buffer);
+
+            // Create another temp file for compressed video
+            const outputTmp = tmp.fileSync({ postfix: ".mp4" });
+
+            // Run ffmpeg compression
+            await new Promise((resolve, reject) => {
+                ffmpeg(inputTmp.name)
+                    .outputOptions([
+                        "-c:v libx264",
+                        "-preset veryfast",
+                        "-crf 28",
+                        "-b:v 800k",
+                        "-c:a aac",
+                        "-b:a 128k"
+                    ])
+                    .save(outputTmp.name)
+                    .on("end", resolve)
+                    .on("error", reject);
+            });
+
+            // Read compressed file back into buffer
+            const compressedBuffer = fs.readFileSync(outputTmp.name);
+
+            // Upload to S3
+            const uploadedFileUrl = await uploadToS3(
+                { buffer: compressedBuffer, originalname: "compressed-" + req.file.originalname, mimetype: "video/mp4" },
+                folder
+            );
+
+            // Cleanup
+            inputTmp.removeCallback();
+            outputTmp.removeCallback();
+
+            console.log("video", uploadedFileUrl)
+            return res.status(200).json({
+                message: "Video compressed & uploaded successfully!",
+                success: true,
+                file: uploadedFileUrl
+            });
+
+        } else {
+            // ✅ If file is NOT a video, upload directly
+            const uploadedFileUrl = await uploadToS3(req.file, folder);
+            console.log("image", uploadedFileUrl)
+
+            return res.status(200).json({
+                message: "File uploaded successfully!",
+                success: true,
+                file: uploadedFileUrl
+            });
+        }
+
+    } catch (error) {
+        console.error("Error on file upload:", error);
+        res.status(500).json({
+            message: "Error on file upload!",
+            success: false
+        });
     }
-
-    const folder = req.body.folder || "uploads";
-
-    // ✅ Check if uploaded file is video
-    if (req.file.mimetype.startsWith("video/")) {
-      // Save uploaded buffer to a temp file
-      const inputTmp = tmp.fileSync({ postfix: path.extname(req.file.originalname) });
-      fs.writeFileSync(inputTmp.name, req.file.buffer);
-
-      // Create another temp file for compressed video
-      const outputTmp = tmp.fileSync({ postfix: ".mp4" });
-
-      // Run ffmpeg compression
-      await new Promise((resolve, reject) => {
-        ffmpeg(inputTmp.name)
-          .outputOptions([
-            "-c:v libx264",
-            "-preset veryfast",
-            "-crf 28",
-            "-b:v 800k",
-            "-c:a aac",
-            "-b:a 128k"
-          ])
-          .save(outputTmp.name)
-          .on("end", resolve)
-          .on("error", reject);
-      });
-
-      // Read compressed file back into buffer
-      const compressedBuffer = fs.readFileSync(outputTmp.name);
-
-      // Upload to S3
-      const uploadedFileUrl = await uploadToS3(
-        { buffer: compressedBuffer, originalname: "compressed-" + req.file.originalname, mimetype: "video/mp4" },
-        folder
-      );
-
-      // Cleanup
-      inputTmp.removeCallback();
-      outputTmp.removeCallback();
-
-      console.log("video",uploadedFileUrl)
-      return res.status(200).json({
-        message: "Video compressed & uploaded successfully!",
-        success: true,
-        file: uploadedFileUrl
-      });
-
-    } else {
-      // ✅ If file is NOT a video, upload directly
-      const uploadedFileUrl = await uploadToS3(req.file, folder);
-      console.log("image",uploadedFileUrl)
-
-      return res.status(200).json({
-        message: "File uploaded successfully!",
-        success: true,
-        file: uploadedFileUrl
-      });
-    }
-
-  } catch (error) {
-    console.error("Error on file upload:", error);
-    res.status(500).json({
-      message: "Error on file upload!",
-      success: false
-    });
-  }
 });
 
 
