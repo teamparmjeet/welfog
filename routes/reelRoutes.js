@@ -5,12 +5,17 @@ const Reel = require("../models/Reel");
 const User = require("../models/Users");
 const multer = require("multer");
 const logUserAction = require("../utils/logUserAction");
-
-
+const fs = require("fs");
+const path = require("path");
+const ffmpeg = require("fluent-ffmpeg");
+const ffmpegInstaller = require("@ffmpeg-installer/ffmpeg");
+const tmp = require("tmp");
 const { uploadToS3 } = require("../lib/s3");
+ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
 
 const upload = multer({ storage: multer.memoryStorage() });
+
 router.post("/", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) {
@@ -20,14 +25,64 @@ router.post("/", upload.single("file"), async (req, res) => {
       });
     }
 
-    const folder = req.body.folder || "uploads"; // Default folder
-    const uploadedFileUrl = await uploadToS3(req.file, folder);
+    const folder = req.body.folder || "uploads";
 
-    res.status(200).json({
-      message: "Single file uploaded successfully!",
-      success: true,
-      file: uploadedFileUrl
-    });
+    // ✅ Check if uploaded file is video
+    if (req.file.mimetype.startsWith("video/")) {
+      // Save uploaded buffer to a temp file
+      const inputTmp = tmp.fileSync({ postfix: path.extname(req.file.originalname) });
+      fs.writeFileSync(inputTmp.name, req.file.buffer);
+
+      // Create another temp file for compressed video
+      const outputTmp = tmp.fileSync({ postfix: ".mp4" });
+
+      // Run ffmpeg compression
+      await new Promise((resolve, reject) => {
+        ffmpeg(inputTmp.name)
+          .outputOptions([
+            "-c:v libx264",
+            "-preset veryfast",
+            "-crf 28",
+            "-b:v 800k",
+            "-c:a aac",
+            "-b:a 128k"
+          ])
+          .save(outputTmp.name)
+          .on("end", resolve)
+          .on("error", reject);
+      });
+
+      // Read compressed file back into buffer
+      const compressedBuffer = fs.readFileSync(outputTmp.name);
+
+      // Upload to S3
+      const uploadedFileUrl = await uploadToS3(
+        { buffer: compressedBuffer, originalname: "compressed-" + req.file.originalname, mimetype: "video/mp4" },
+        folder
+      );
+
+      // Cleanup
+      inputTmp.removeCallback();
+      outputTmp.removeCallback();
+
+      console.log("video",uploadedFileUrl)
+      return res.status(200).json({
+        message: "Video compressed & uploaded successfully!",
+        success: true,
+        file: uploadedFileUrl
+      });
+
+    } else {
+      // ✅ If file is NOT a video, upload directly
+      const uploadedFileUrl = await uploadToS3(req.file, folder);
+      console.log("image",uploadedFileUrl)
+
+      return res.status(200).json({
+        message: "File uploaded successfully!",
+        success: true,
+        file: uploadedFileUrl
+      });
+    }
 
   } catch (error) {
     console.error("Error on file upload:", error);
@@ -40,7 +95,9 @@ router.post("/", upload.single("file"), async (req, res) => {
 
 
 
+
 router.post("/upload", async (req, res) => {
+    console.log("sd")
     try {
         const data = await req.body;
 
