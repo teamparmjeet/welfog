@@ -7,8 +7,8 @@ const bodyParser = require("body-parser");
 
 // ✅ Use CORS before routes
 app.use(cors({
-  origin: process.env.FRONTEND_ORIGIN || 'http://localhost:4000',
-  // origin: "*",
+  // origin: process.env.FRONTEND_ORIGIN || 'http://localhost:4000',
+  origin: "*",
   credentials: true,
 }));
 

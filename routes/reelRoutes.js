@@ -15,8 +15,8 @@ ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
 
 const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 200 * 1024 * 1024 } // allow up to 200MB
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 200 * 1024 * 1024 } // allow up to 200MB
 });
 
 
@@ -312,6 +312,34 @@ router.post("/upload", async (req, res) => {
     }
 });
 
+router.get("/by-music/:id", async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!id) {
+            return res.status(400).json({ message: "Music ID is required" });
+        }
+
+        // Find reels that use this music
+        const reels = await Reel.find({ music: id })
+            .populate("music") // populate music details
+            .populate("user", "username") // optional: populate user info
+            .populate("comments"); // optional: populate comments
+
+        if (!reels || reels.length === 0) {
+            return res.status(404).json({ message: "No reels found for this music" });
+        }
+
+        return res.status(200).json({
+            message: "Reels fetched successfully",
+            data: reels
+        });
+
+    } catch (error) {
+        console.error("Error fetching reels by music:", error);
+        return res.status(500).json({ message: "Error fetching reels", error: error.message });
+    }
+});
 router.get("/", async (req, res) => {
     try {
         const reels = await Reel.find({});
@@ -382,23 +410,42 @@ router.get("/shownew", async (req, res) => {
     }
 });
 
-router.get("/view/:id", async (req, res) => {
-    try {
-        const updated = await Reel.findByIdAndUpdate(
-            req.params.id,
-            { $inc: { views: 1 } }
-        );
+router.post("/view", async (req, res) => {
+  try {
+    const { reelId, userId } = req.body;
 
-        if (!updated) {
-            return res.status(404).json({ message: "Video not found!" });
-        }
-
-        res.sendStatus(200);
-    } catch (error) {
-        console.error("Error incrementing video view:", error);
-        res.status(500).json({ message: "Error incrementing video view" });
+    if (!reelId || !userId) {
+      return res.status(400).json({ message: "reelId and userId are required" });
     }
+
+    if (!mongoose.isValidObjectId(reelId) || !mongoose.isValidObjectId(userId)) {
+      return res.status(400).json({ message: "Invalid reelId or userId" });
+    }
+
+    // Atomically add user to viewsdata only if not present, and increment views only in that case
+    const updated = await Reel.findOneAndUpdate(
+      { _id: reelId, viewsdata: { $ne: userId } },
+      { $addToSet: { viewsdata: userId }, $inc: { views: 1 } },
+      { new: true }
+    );
+
+    if (!updated) {
+      // Either reel not found, or user already counted (can't distinguish without another query)
+      const reelExists = await Reel.exists({ _id: reelId });
+      if (!reelExists) return res.status(404).json({ message: "Reel not found" });
+      return res.status(200).json({ message: "View already counted" });
+    }
+
+    return res.status(200).json({
+      message: "View added",
+      views: updated.views,
+    });
+  } catch (error) {
+    console.error("Error incrementing reel view:", error);
+    res.status(500).json({ message: "Error incrementing reel view" });
+  }
 });
+
 
 
 router.get("/:id", async (req, res) => {
