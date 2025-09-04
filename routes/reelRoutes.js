@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const router = express.Router();
 const Reel = require("../models/Reel");
 const User = require("../models/Users");
+const Music = require("../models/Music"); // <-- import Music model
 const multer = require("multer");
 const logUserAction = require("../utils/logUserAction");
 const fs = require("fs");
@@ -10,6 +11,7 @@ const path = require("path");
 const ffmpeg = require("fluent-ffmpeg");
 const ffmpegInstaller = require("@ffmpeg-installer/ffmpeg");
 const tmp = require("tmp");
+const https = require("https");
 const { uploadToS3 } = require("../lib/s3");
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
@@ -27,104 +29,196 @@ router.post(
         { name: "thumbnail", maxCount: 1 },
     ]),
     async (req, res) => {
-        console.log("===== [FULL UPLOAD STARTED] =====");
+        console.log("===== [FULL UPLOAD WITH TRIM STARTED] =====");
 
-        let inputTmp, outputTmp, thumbTmp;
+        // Keep track of all temporary files for cleanup
+        const tempFiles = [];
 
         try {
-            console.log("[STEP 1] Incoming request body:", req.body);
-            console.log("[STEP 1] Incoming files:", Object.keys(req.files || {}));
+            // --- Step 1: Extract data from request ---
+            const {
+                user,
+                userid,
+                username,
+                caption,
+                musicId,
+                videoStartTime,
+                videoEndTime,
+                musicStartTime,
+                musicEndTime,
 
-            const { user, userid, username, caption, music } = req.body;
+            } = req.body;
+
+            console.log("[STEP 1] Received data:", { caption, musicId, videoStartTime, videoEndTime, musicStartTime, musicEndTime });
+
+
             if (!user || !req.files || !req.files.video) {
-                console.error("[ERROR] Missing required data: user or video file");
-                return res.status(400).json({ success: false, message: "User or video missing!" });
+                return res
+                    .status(400)
+                    .json({ success: false, message: "User or video file missing!" });
             }
 
             const videoFile = req.files.video[0];
             const thumbFile = req.files.thumbnail ? req.files.thumbnail[0] : null;
-            console.log("[STEP 2] Video file received:", videoFile.originalname);
-            if (thumbFile) console.log("[STEP 2] Thumbnail file received:", thumbFile.originalname);
-            else console.log("[STEP 2] No thumbnail provided, will auto-generate");
 
-            // --- Step 3: Compress video ---
-            console.log("[STEP 3] Starting video compression...");
-            inputTmp = tmp.fileSync({ postfix: path.extname(videoFile.originalname) });
+            // --- Step 2: Write original video to a temporary file ---
+            const inputTmp = tmp.fileSync({ postfix: path.extname(videoFile.originalname) });
+            tempFiles.push(inputTmp);
             fs.writeFileSync(inputTmp.name, videoFile.buffer);
-            outputTmp = tmp.fileSync({ postfix: ".mp4" });
+
+            // --- Step 3: Trim and compress video in one go ---
+            console.log("[STEP 3] Starting video processing (trim & compress)");
+            const outputTmp = tmp.fileSync({ postfix: ".mp4" });
+            tempFiles.push(outputTmp);
 
             await new Promise((resolve, reject) => {
-                ffmpeg(inputTmp.name)
+                let command = ffmpeg(inputTmp.name);
+
+                // Apply trimming if start and end times are provided and valid
+                if (videoStartTime && videoEndTime) {
+                    const startTimeSec = parseFloat(videoStartTime) / 1000;
+                    const endTimeSec = parseFloat(videoEndTime) / 1000;
+                    if (!isNaN(startTimeSec) && !isNaN(endTimeSec) && endTimeSec > startTimeSec) {
+                        const durationSec = endTimeSec - startTimeSec;
+                        console.log(`-> Trimming video from ${startTimeSec.toFixed(2)}s for ${durationSec.toFixed(2)}s`);
+                        command.seekInput(startTimeSec).duration(durationSec);
+                    }
+                }
+
+                command
                     .outputOptions([
-                        "-c:v libx264",
-                        "-preset veryfast",
-                        "-crf 28",
-                        "-b:v 800k",
-                        "-c:a aac",
-                        "-b:a 128k",
+                        "-c:v libx264",    // Video codec
+                        "-preset veryfast",// Encoding speed
+                        "-crf 28",         // Constant Rate Factor for quality/size balance
+                        "-b:v 1500k",      // Max video bitrate
+                        "-c:a aac",        // Audio codec
+                        "-b:a 128k",       // Audio bitrate
                     ])
                     .save(outputTmp.name)
                     .on("end", () => {
-                        console.log("[STEP 3] Video compression completed");
+                        console.log("[STEP 3] Video processing complete.");
                         resolve();
                     })
                     .on("error", (err) => {
-                        console.error("[ERROR] Video compression failed:", err.message);
+                        console.error("[ERROR] Video processing failed:", err.message);
                         reject(err);
                     });
             });
 
-            const compressedBuffer = fs.readFileSync(outputTmp.name);
-            console.log("[STEP 4] Uploading compressed video to S3...");
-            const videoUrl = await uploadToS3(
-                { buffer: compressedBuffer, originalname: "compressed-" + videoFile.originalname, mimetype: "video/mp4" },
-                "videos"
-            );
-            console.log("[STEP 4] Video uploaded successfully:", videoUrl);
+            let finalVideoPath = outputTmp.name;
+            let finalMusicId = musicId || null;
 
-            // --- Step 5: Handle thumbnail ---
-            let thumbnailUrl = null;
-            try {
-                if (thumbFile) {
-                    console.log("[STEP 5] Uploading provided thumbnail...");
-                    thumbnailUrl = await uploadToS3(thumbFile, "thumbnails");
-                    console.log("[STEP 5] Thumbnail uploaded successfully:", thumbnailUrl);
-                } else {
-                    console.log("[STEP 5] Generating thumbnail from compressed video...");
-                    thumbTmp = tmp.fileSync({ postfix: ".jpg" });
+            // --- Step 4: Trim music and merge with video ---
+            if (musicId && mongoose.Types.ObjectId.isValid(musicId)) {
+                const musicDoc = await Music.findById(musicId);
+                if (musicDoc?.url) {
+                    console.log("[STEP 4] Starting audio processing for:", musicDoc.url);
+
+                    // Download audio
+                    const musicTmp = tmp.fileSync({ postfix: path.extname(musicDoc.url) });
+                    tempFiles.push(musicTmp);
                     await new Promise((resolve, reject) => {
-                        ffmpeg(outputTmp.name) // <-- use compressed file path
+                        const file = fs.createWriteStream(musicTmp.name);
+                        https.get(musicDoc.url, (response) => {
+                            response.pipe(file);
+                            file.on("finish", () => file.close(resolve));
+                        }).on("error", reject);
+                    });
+
+                    let musicInputPath = musicTmp.name;
+
+                    // Trim audio if times are provided
+                    if (musicStartTime && musicEndTime) {
+                        const startTimeSec = parseFloat(musicStartTime) / 1000;
+                        const endTimeSec = parseFloat(musicEndTime) / 1000;
+                        if (!isNaN(startTimeSec) && !isNaN(endTimeSec) && endTimeSec > startTimeSec) {
+                            const durationSec = endTimeSec - startTimeSec;
+                            console.log(`-> Trimming audio from ${startTimeSec.toFixed(2)}s for ${durationSec.toFixed(2)}s`);
+                            const trimmedMusicTmp = tmp.fileSync({ postfix: ".mp3" });
+                            tempFiles.push(trimmedMusicTmp);
+
+                            await new Promise((resolve, reject) => {
+                                ffmpeg(musicTmp.name)
+                                    .seekInput(startTimeSec)
+                                    .duration(durationSec)
+                                    .audioCodec('libmp3lame') // Re-encode to ensure compatibility
+                                    .save(trimmedMusicTmp.name)
+                                    .on('end', resolve)
+                                    .on('error', reject);
+                            });
+                            musicInputPath = trimmedMusicTmp.name;
+                        }
+                    }
+
+                    // Merge trimmed video + (possibly) trimmed audio
+                    console.log("-> Merging video with final audio track.");
+                    const mergedTmp = tmp.fileSync({ postfix: ".mp4" });
+                    tempFiles.push(mergedTmp);
+                    await new Promise((resolve, reject) => {
+                        ffmpeg(outputTmp.name)
+                            .input(musicInputPath)
+                            .outputOptions([
+                                "-c:v copy",    // Copy video stream without re-encoding
+                                "-c:a aac",     // Re-encode merged audio
+                                "-map 0:v:0",   // Map video from the first input
+                                "-map 1:a:0",   // Map audio from the second input
+                                "-shortest",    // Finish encoding when the shortest input stream ends
+                            ])
+                            .save(mergedTmp.name)
                             .on("end", () => {
-                                console.log("[STEP 5] Thumbnail generation complete");
+                                console.log("[STEP 4] Merge complete.");
+                                finalVideoPath = mergedTmp.name;
                                 resolve();
                             })
                             .on("error", (err) => {
-                                console.error("[ERROR] Thumbnail generation failed:", err.message);
+                                console.error("[ERROR] Merge failed:", err.message);
                                 reject(err);
-                            })
-                            .screenshots({
-                                timestamps: [1],
-                                filename: path.basename(thumbTmp.name),
-                                folder: path.dirname(thumbTmp.name),
-                                size: "640x?",
                             });
                     });
-                    const thumbBuffer = fs.readFileSync(thumbTmp.name);
-                    console.log("[STEP 5] Uploading generated thumbnail...");
-                    thumbnailUrl = await uploadToS3(
-                        { buffer: thumbBuffer, originalname: `thumb-${Date.now()}.jpg`, mimetype: "image/jpeg" },
-                        "thumbnails"
-                    );
-                    console.log("[STEP 5] Thumbnail uploaded successfully:", thumbnailUrl);
+                } else {
+                    finalMusicId = null; // Music doc not found
                 }
-            } catch (thumbError) {
-                console.error("[WARNING] Thumbnail step failed:", thumbError.message);
-                // fallback: use placeholder thumbnail
-                thumbnailUrl = "https://your-bucket/default-thumb.jpg";
             }
 
-            // --- Step 6: Save to DB ---
-            console.log("[STEP 6] Saving reel to database...");
+            // --- Step 5: Upload final processed video to S3 ---
+            console.log("[STEP 5] Uploading final video to S3.");
+            const finalBuffer = fs.readFileSync(finalVideoPath);
+            const videoUrl = await uploadToS3({
+                buffer: finalBuffer,
+                originalname: `reel-${Date.now()}.mp4`,
+                mimetype: "video/mp4",
+            }, "videos");
+
+            // --- Step 6: Handle and upload thumbnail ---
+            console.log("[STEP 6] Handling thumbnail.");
+            let thumbnailUrl = null;
+            if (thumbFile) {
+                thumbnailUrl = await uploadToS3(thumbFile, "thumbnails");
+            } else {
+                // Generate thumbnail from the first second of the final video
+                const thumbTmp = tmp.fileSync({ postfix: ".jpg" });
+                tempFiles.push(thumbTmp);
+                await new Promise((resolve, reject) => {
+                    ffmpeg(finalVideoPath)
+                        .screenshots({
+                            timestamps: [0], // Take screenshot at the beginning
+                            filename: path.basename(thumbTmp.name),
+                            folder: path.dirname(thumbTmp.name),
+                            size: "640x?",
+                        })
+                        .on("end", resolve)
+                        .on("error", reject);
+                });
+                const thumbBuffer = fs.readFileSync(thumbTmp.name);
+                thumbnailUrl = await uploadToS3({
+                    buffer: thumbBuffer,
+                    originalname: `thumb-${Date.now()}.jpg`,
+                    mimetype: "image/jpeg",
+                }, "thumbnails");
+            }
+
+            // --- Step 7: Save reel metadata to database ---
+            console.log("[STEP 7] Saving reel to database.");
             const newReel = new Reel({
                 user,
                 userid,
@@ -132,55 +226,34 @@ router.post(
                 videoUrl,
                 thumbnailUrl,
                 caption,
-                music: music || null,
+                music: finalMusicId,
             });
             const savedReel = await newReel.save();
-            console.log("[STEP 6] Reel saved with ID:", savedReel._id);
 
-            // --- Step 7: Log user action ---
-            try {
-                console.log("[STEP 7] Logging user action...");
-                await logUserAction({
-                    user: savedReel.user,
-                    action: "upload_reel",
-                    targetType: "Reel",
-                    targetId: savedReel._id,
-                    device: req.headers["user-agent"],
-                    location: {
-                        ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress || "",
-                        country: req.headers["cf-ipcountry"] || "",
-                        city: "",
-                        pincode: "",
-                    },
-                });
-                console.log("[STEP 7] User action logged successfully");
-            } catch (logError) {
-                console.error("[WARNING] Log user action failed:", logError.message);
-            }
-
-            console.log("===== [FULL UPLOAD COMPLETED SUCCESSFULLY] =====");
+            console.log("===== [FULL UPLOAD SUCCESS] =====");
             res.status(201).json({
                 message: "Reel uploaded successfully!",
                 success: true,
                 data: savedReel,
             });
-        } catch (error) {
+
+        } catch (err) {
             console.error("===== [FULL UPLOAD ERROR] =====");
-            console.error(error);
-            res.status(500).json({ success: false, message: "Error uploading reel" });
+            console.error(err);
+            res.status(500).json({ success: false, message: "Server error during reel upload." });
         } finally {
-            // clean up temp files at the very end
-            try {
-                if (inputTmp) inputTmp.removeCallback();
-                if (outputTmp) outputTmp.removeCallback();
-                if (thumbTmp) thumbTmp.removeCallback();
-            } catch (cleanupErr) {
-                console.error("[WARNING] Temp cleanup failed:", cleanupErr.message);
-            }
+            // --- Final Step: Cleanup all temporary files ---
+            console.log("-> Cleaning up temporary files.");
+            tempFiles.forEach((t) => {
+                try {
+                    if (t) t.removeCallback();
+                } catch (cleanupErr) {
+                    console.warn("Warning: Could not remove temp file.", cleanupErr.message)
+                }
+            });
         }
     }
 );
-
 
 
 router.post("/", upload.single("file"), async (req, res) => {
@@ -316,8 +389,8 @@ router.get("/by-music/:id", async (req, res) => {
     try {
         const { id } = req.params;
 
-        if (!id) {
-            return res.status(400).json({ message: "Music ID is required" });
+        if (!id || id === "null" || id === "undefined") {
+            return res.status(400).json({ message: "Valid Music ID is required" });
         }
 
         // Find reels that use this music
@@ -411,39 +484,39 @@ router.get("/shownew", async (req, res) => {
 });
 
 router.post("/view", async (req, res) => {
-  try {
-    const { reelId, userId } = req.body;
+    try {
+        const { reelId, userId } = req.body;
 
-    if (!reelId || !userId) {
-      return res.status(400).json({ message: "reelId and userId are required" });
+        if (!reelId || !userId) {
+            return res.status(400).json({ message: "reelId and userId are required" });
+        }
+
+        if (!mongoose.isValidObjectId(reelId) || !mongoose.isValidObjectId(userId)) {
+            return res.status(400).json({ message: "Invalid reelId or userId" });
+        }
+
+        // Atomically add user to viewsdata only if not present, and increment views only in that case
+        const updated = await Reel.findOneAndUpdate(
+            { _id: reelId, viewsdata: { $ne: userId } },
+            { $addToSet: { viewsdata: userId }, $inc: { views: 1 } },
+            { new: true }
+        );
+
+        if (!updated) {
+            // Either reel not found, or user already counted (can't distinguish without another query)
+            const reelExists = await Reel.exists({ _id: reelId });
+            if (!reelExists) return res.status(404).json({ message: "Reel not found" });
+            return res.status(200).json({ message: "View already counted" });
+        }
+
+        return res.status(200).json({
+            message: "View added",
+            views: updated.views,
+        });
+    } catch (error) {
+        console.error("Error incrementing reel view:", error);
+        res.status(500).json({ message: "Error incrementing reel view" });
     }
-
-    if (!mongoose.isValidObjectId(reelId) || !mongoose.isValidObjectId(userId)) {
-      return res.status(400).json({ message: "Invalid reelId or userId" });
-    }
-
-    // Atomically add user to viewsdata only if not present, and increment views only in that case
-    const updated = await Reel.findOneAndUpdate(
-      { _id: reelId, viewsdata: { $ne: userId } },
-      { $addToSet: { viewsdata: userId }, $inc: { views: 1 } },
-      { new: true }
-    );
-
-    if (!updated) {
-      // Either reel not found, or user already counted (can't distinguish without another query)
-      const reelExists = await Reel.exists({ _id: reelId });
-      if (!reelExists) return res.status(404).json({ message: "Reel not found" });
-      return res.status(200).json({ message: "View already counted" });
-    }
-
-    return res.status(200).json({
-      message: "View added",
-      views: updated.views,
-    });
-  } catch (error) {
-    console.error("Error incrementing reel view:", error);
-    res.status(500).json({ message: "Error incrementing reel view" });
-  }
 });
 
 

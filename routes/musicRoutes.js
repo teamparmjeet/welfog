@@ -6,7 +6,7 @@ const router = express.Router();
 router.post("/new", async (req, res) => {
 
     try {
-        const { title, artist, url, duration, uploadedBy, thumbnail } =  req.body;
+        const { title, artist, url, duration, uploadedBy, thumbnail } = req.body;
 
         if (!title || !url) {
 
@@ -50,6 +50,24 @@ router.get("/", async (req, res) => {
         console.log("Error in", error);
     }
 });
+router.get("/search", async (req, res) => {
+    try {
+        const { q } = req.query;
+        if (!q) return res.json([]);
+
+        const music = await Music.find({
+            $or: [
+                { title: { $regex: q, $options: "i" } },
+                { artist: { $regex: q, $options: "i" } }
+            ]
+        }).limit(10);
+
+        res.json(music);
+    } catch (err) {
+        res.status(500).json({ message: "Server error" });
+    }
+});
+
 
 //find single music 
 router.get("/:id", async (req, res) => {
@@ -80,9 +98,9 @@ router.put("/update/:id", async (req, res) => {
         const music = await Music.findById(req.params.id);
         if (!music) { res.status(404).json({ message: "Music not found" }) };
 
-        if(title) music.title = title;
-        if(artist) music.artist = artist;
-        if(thumbnail) music.thumbnail = thumbnail;
+        if (title) music.title = title;
+        if (artist) music.artist = artist;
+        if (thumbnail) music.thumbnail = thumbnail;
 
         const musicSave = await music.save();
 
@@ -96,7 +114,7 @@ router.put("/update/:id", async (req, res) => {
         );
 
     } catch (error) {
-        res.status(500).json({message: "Error to Update music"});
+        res.status(500).json({ message: "Error to Update music" });
         console.log(error);
     }
 });
